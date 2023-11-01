@@ -59,6 +59,7 @@ export const runConfirmedNativeTokenExtraWorker = async (): Promise<void> => {
     return order ?? undefined;
   }
 
+  // TODO: this method should be just checking the data from etherscan
   const scanTxid = async (tx: BlocksWithTransactions['transactions'][0]) => {
     assert.equal(typeof tx, 'object', 'tx is not object');
     assert(tx.from, 'from missing');
@@ -96,6 +97,7 @@ export const runConfirmedNativeTokenExtraWorker = async (): Promise<void> => {
       ns.times(tx.gasLimit.toString(), tx.gasPrice.toString())
     );
 
+    // TODO: this is redundant the order has been already checked (double check maybe we need to make sure idk)
     const order = await fetchOrderForAddress(tx.from);
 
     if (!order) {
@@ -123,6 +125,7 @@ export const runConfirmedNativeTokenExtraWorker = async (): Promise<void> => {
     return true;
   };
 
+  // TODO: additional call for the block timestamp, then modify the query with block_start + pagination + ascending order
   const getEtherScanTxListForAddress = async (address: string) => {
     const txList = await axios
       .get(
@@ -153,6 +156,7 @@ export const runConfirmedNativeTokenExtraWorker = async (): Promise<void> => {
         return;
       }
 
+      // TODO: check if its needed
       if (!order.depositAddress) {
         // The deposit address may have been unassigned
         logger.error('Order %s has no deposit address', orderId);
@@ -163,6 +167,7 @@ export const runConfirmedNativeTokenExtraWorker = async (): Promise<void> => {
       let txs;
 
       try {
+        // TODO: this should be ascending order starting from the first block after the order was created. We need to add one more query https://docs.etherscan.io/api-endpoints/blocks#get-block-number-by-timestamp
         // In descending order
         txs = await getEtherScanTxListForAddress(order.depositAddress.address);
       } catch (error: any) {
@@ -171,15 +176,18 @@ export const runConfirmedNativeTokenExtraWorker = async (): Promise<void> => {
         return;
       }
 
+      // TODO: lets move it to scanId (check in etherscan docs if its possible to query only tx with value)
       // Only transactions with a value
       txs = txs.filter(tx => ethers.BigNumber.from(tx.value).gt(0));
 
+      // TODO: This is not working properly. If we are basically only checking the latest ten blocks. Use pagination instead and start from the oldest vaild (timestime of the order created)
       // Only the first 10 transactions
       txs = txs.slice(0, 10);
 
       logger.info('Found %s transactions for order %s', txs.length, orderId);
 
       await pMap(txs, async etherscanTx => {
+        // TODO: I think this is redundant and we can just use the data fetched from etherscan (double check)
         const ethersTx = await nodeProvider.getTransaction(etherscanTx.hash);
 
         if (!ethersTx) {
@@ -194,8 +202,10 @@ export const runConfirmedNativeTokenExtraWorker = async (): Promise<void> => {
           return;
         }
 
+        // TODO: this is also redundand, we already fetch from etherscan
         const block = await nodeProvider.getBlock(ethersTx.blockNumber);
 
+        // TODO: fetch only after this timestamp (etherscan block_start)
         const timestamp = new Date(block.timestamp * 1000);
 
         // Only transactions that happened after the order was created
