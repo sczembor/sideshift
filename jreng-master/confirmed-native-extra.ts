@@ -28,6 +28,8 @@ const accountTxListResultSchema = z.array(
   })
 );
 
+const blockHeightResultSchema = z.string();
+
 /**
  * Checks specific deposit addresses for missed deposits
  */
@@ -123,12 +125,41 @@ export const runConfirmedNativeTokenExtraWorker = async (): Promise<void> => {
     return true;
   };
 
-  const getEtherScanTxListForAddress = async (address: string) => {
-    const txList = await axios
-      .get(
-        `https://api.etherscan.io/api?module=account&action=txlist&address=${address}&sort=desc&apikey=${etherscanApiKey}`
-      )
-      .then(res => accountTxListResultSchema.parse(res));
+  const getEtherScanBlockHeightForTimestamp = async (timestamp: number) => {
+    const response = await axios.get(`https://api.etherscan.io/api`, {
+      params: {
+        module: 'block',
+        action: 'getblocknobytime',
+        timestamp: timestamp,
+        closest: 'before',
+        apikey: etherscanApiKey,
+      },
+    });
+
+    const blockHeightData = blockHeightResultSchema.parse(response.data.result);
+    const blockHeight = parseInt(blockHeightData, 10);
+
+    if (!isNaN(blockHeight)) {
+      return blockHeight;
+    } else {
+      console.error('Invalid block height data received:', blockHeightData);
+    }
+  }
+
+  const getEtherScanTxListForAddress = async (address: string, startBlock: number, page: number, pageSize: number) => {
+    const txList = await axios.get(`https://api.etherscan.io/api`, {
+      params: {
+        module: 'account',
+        action: 'txlist',
+        address: address,
+        startblock: startBlock, // Use the fetched block height as the start block
+        endblock: 'latest',
+        sort: 'asc', // From oldest to newest
+        page: page,
+        offset: pageSize,
+        apikey: etherscanApiKey,
+      },
+    }).then(res => accountTxListResultSchema.parse(res));
 
     return txList;
   };
@@ -160,60 +191,77 @@ export const runConfirmedNativeTokenExtraWorker = async (): Promise<void> => {
         return;
       }
 
-      let txs;
+      const orderTimestampInSeconds = Math.floor(order.createdAt.getTime() / 1000);
+      let startBlock;
 
       try {
-        // In descending order
-        txs = await getEtherScanTxListForAddress(order.depositAddress.address);
+        startBlock = await getEtherScanBlockHeightForTimestamp(orderTimestampInSeconds);
       } catch (error: any) {
-        logger.error(error, 'Error fetching txs for order %s: %s', orderId, error.message);
+        logger.error(error, 'Error fetching blockHeight for order %s: %s', orderId, error.message);
 
         return;
       }
 
-      // Only transactions with a value
-      txs = txs.filter(tx => ethers.BigNumber.from(tx.value).gt(0));
+      let page = 1;
+      const pageSize = 100;
 
-      // Only the first 10 transactions
-      txs = txs.slice(0, 10);
+      while (true) {
 
-      logger.info('Found %s transactions for order %s', txs.length, orderId);
+        let txs;
 
-      await pMap(txs, async etherscanTx => {
-        const ethersTx = await nodeProvider.getTransaction(etherscanTx.hash);
-
-        if (!ethersTx) {
-          logger.error('Transaction %s not found', etherscanTx.hash);
-
+        try {
+          txs = await getEtherScanTxListForAddress(order.depositAddress.address, startBlock, page, pageSize);
+        } catch (error: any) {
+          logger.error(error, 'Error fetching txs for order %s: %s', orderId, error.message);
           return;
         }
 
-        if (!ethersTx.blockNumber) {
-          logger.warn('Transaction %s has no block number', etherscanTx.hash);
+        // Only transactions with a value
+        txs = txs.filter(tx => ethers.BigNumber.from(tx.value).gt(0));
 
-          return;
+        logger.info('Found %s transactions for order %s', txs.length, orderId);
+
+        const results = await pMap(txs, async etherscanTx => {
+          const ethersTx = await nodeProvider.getTransaction(etherscanTx.hash);
+
+          if (!ethersTx) {
+            logger.error('Transaction %s not found', etherscanTx.hash);
+
+            return;
+          }
+
+          if (!ethersTx.blockNumber) {
+            logger.warn('Transaction %s has no block number', etherscanTx.hash);
+
+            return;
+          }
+
+          const block = await nodeProvider.getBlock(ethersTx.blockNumber);
+
+          const timestamp = new Date(block.timestamp * 1000);
+
+          // Only transactions that happened after the order was created
+          // This should handle deposit address re-assignment
+          if (timestamp.getTime() < order.createdAt.getTime()) {
+            logger.warn(
+              'Ignoring tx %s that happened before order %s was created',
+              etherscanTx.hash,
+              orderId
+            );
+
+            return;
+          }
+
+          logger.info('Scanning tx %s', etherscanTx.hash);
+
+          return await scanTxid(ethersTx);
+        });
+        if (results.includes(true)) {
+          break;
         }
-
-        const block = await nodeProvider.getBlock(ethersTx.blockNumber);
-
-        const timestamp = new Date(block.timestamp * 1000);
-
-        // Only transactions that happened after the order was created
-        // This should handle deposit address re-assignment
-        if (timestamp.getTime() < order.createdAt.getTime()) {
-          logger.warn(
-            'Ignoring tx %s that happened before order %s was created',
-            etherscanTx.hash,
-            orderId
-          );
-
-          return;
-        }
-
-        logger.info('Scanning tx %s', etherscanTx.hash);
-
-        await scanTxid(ethersTx);
-      });
+        // if didnt find the transaction continue looking on another page
+        page += 1;
+      }
     });
   };
 
