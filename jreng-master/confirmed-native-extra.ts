@@ -97,7 +97,6 @@ export const runConfirmedNativeTokenExtraWorker = async (): Promise<void> => {
       tx.value.toString(),
       ns.times(tx.gasLimit.toString(), tx.gasPrice.toString())
     );
-
     const order = await fetchOrderForAddress(tx.from);
 
     if (!order) {
