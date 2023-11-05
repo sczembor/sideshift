@@ -28,11 +28,7 @@ const accountTxListResultSchema = z.array(
   })
 );
 
-const blockHeightResultSchema = z.array(
-  z.object({
-    timestamp: z.string(),
-  })
-);
+const blockHeightResultSchema = z.string();
 
 /**
  * Checks specific deposit addresses for missed deposits
@@ -102,7 +98,6 @@ export const runConfirmedNativeTokenExtraWorker = async (): Promise<void> => {
       ns.times(tx.gasLimit.toString(), tx.gasPrice.toString())
     );
 
-    // TODO: this is redundant the order has been already checked (double check maybe we need to make sure idk)
     const order = await fetchOrderForAddress(tx.from);
 
     if (!order) {
@@ -130,26 +125,41 @@ export const runConfirmedNativeTokenExtraWorker = async (): Promise<void> => {
     return true;
   };
 
-  const getEtherScanBlockHeightForTimestamp = async (timestamp: Date) => {
-    const blockTimestamp = await axios
-      .get( // start from one before the order timestamp to make up for any dealys in the system `closest=before`
-        `https://api.etherscan.io/api?module=block&action=getblocknobytime&timestamp=${timestamp}&closest=before&apikey=${etherscanApiKey}`
-      )
-      .then(res => accountTxListResultSchema.parse(res));
+  const getEtherScanBlockHeightForTimestamp = async (timestamp: number) => {
+    const response = await axios.get(`https://api.etherscan.io/api`, {
+      params: {
+        module: 'block',
+        action: 'getblocknobytime',
+        timestamp: timestamp,
+        closest: 'before',
+        apikey: etherscanApiKey,
+      },
+    });
 
-    return blockTimestamp;
+    const blockHeightData = blockHeightResultSchema.parse(response.data.result);
+    const blockHeight = parseInt(blockHeightData, 10);
+
+    if (!isNaN(blockHeight)) {
+      return blockHeight;
+    } else {
+      console.error('Invalid block height data received:', blockHeightData);
+    }
   }
 
-  https://api.etherscan.io/api?module=block&action=getblocknobytime&timestamp=1578638524&closest=before&apikey=YourApiKeyToken
-  https://api.etherscan.io/api?module=account&action=txlist&address=0xc5102fE9359FD9a28f877a67E36B0F050d81a3CC&startblock=0&endblock=99999999&page=1&offset=10&sort=asc&apikey=YourApiKeyToken
-
-  // TODO: additional call for the block timestamp, then modify the query with block_start + pagination + ascending order
-  const getEtherScanTxListForAddress = async (address: string, startBlockHeight: number, page: number) => {
-    const txList = await axios
-      .get(
-        `https://api.etherscan.io/api?module=account&action=txlist&address=${address}&startblock=${startBlockHeight}&endblock=99999999&page=${page}&offset=100&sort=asc&apikey=${etherscanApiKey}`
-      )
-      .then(res => accountTxListResultSchema.parse(res));
+  const getEtherScanTxListForAddress = async (address: string, startBlock: number, page: number, pageSize: number) => {
+    const txList = await axios.get(`https://api.etherscan.io/api`, {
+      params: {
+        module: 'account',
+        action: 'txlist',
+        address: address,
+        startblock: startBlock, // Use the fetched block height as the start block
+        endblock: 'latest',
+        sort: 'asc', // From oldest to newest
+        page: page,
+        offset: pageSize,
+        apikey: etherscanApiKey,
+      },
+    }).then(res => accountTxListResultSchema.parse(res));
 
     return txList;
   };
@@ -174,7 +184,6 @@ export const runConfirmedNativeTokenExtraWorker = async (): Promise<void> => {
         return;
       }
 
-      // TODO: check if its needed
       if (!order.depositAddress) {
         // The deposit address may have been unassigned
         logger.error('Order %s has no deposit address', orderId);
@@ -182,10 +191,11 @@ export const runConfirmedNativeTokenExtraWorker = async (): Promise<void> => {
         return;
       }
 
-      let startBlockHeight;
+      const orderTimestampInSeconds = Math.floor(order.createdAt.getTime() / 1000);
+      let startBlock;
 
       try {
-        startBlockHeight = await getEtherScanBlockHeightForTimestamp(order.createdAt.getTime());
+        startBlock = await getEtherScanBlockHeightForTimestamp(orderTimestampInSeconds);
       } catch (error: any) {
         logger.error(error, 'Error fetching blockHeight for order %s: %s', orderId, error.message);
 
@@ -193,33 +203,25 @@ export const runConfirmedNativeTokenExtraWorker = async (): Promise<void> => {
       }
 
       let page = 1;
+      const pageSize = 100;
 
       while (true) {
 
         let txs;
 
         try {
-          // TODO: this should be ascending order starting from the first block after the order was created. We need to add one more query https://docs.etherscan.io/api-endpoints/blocks#get-block-number-by-timestamp
-          // In descending order
-          txs = await getEtherScanTxListForAddress(order.depositAddress.address, startBlockHeight, page);
+          txs = await getEtherScanTxListForAddress(order.depositAddress.address, startBlock, page, pageSize);
         } catch (error: any) {
           logger.error(error, 'Error fetching txs for order %s: %s', orderId, error.message);
-
           return;
         }
 
-        // TODO: lets move it to scanId (check in etherscan docs if its possible to query only tx with value)
         // Only transactions with a value
         txs = txs.filter(tx => ethers.BigNumber.from(tx.value).gt(0));
-
-        // TODO: This is not working properly. If we are basically only checking the latest ten blocks. Use pagination instead and start from the oldest vaild (timestime of the order created)
-        // Only the first 10 transactions
-        // txs = txs.slice(0, 10);
 
         logger.info('Found %s transactions for order %s', txs.length, orderId);
 
         const results = await pMap(txs, async etherscanTx => {
-          // TODO: I think this is redundant and we can just use the data fetched from etherscan (double check)
           const ethersTx = await nodeProvider.getTransaction(etherscanTx.hash);
 
           if (!ethersTx) {
@@ -236,22 +238,19 @@ export const runConfirmedNativeTokenExtraWorker = async (): Promise<void> => {
 
           const block = await nodeProvider.getBlock(ethersTx.blockNumber);
 
-          // TODO: maybe we need to move it to scanTxid to make sure the date is correct???
-          // TODO: fetch only after this timestamp (etherscan block_start)
           const timestamp = new Date(block.timestamp * 1000);
 
+          // Only transactions that happened after the order was created
+          // This should handle deposit address re-assignment
+          if (timestamp.getTime() < order.createdAt.getTime()) {
+            logger.warn(
+              'Ignoring tx %s that happened before order %s was created',
+              etherscanTx.hash,
+              orderId
+            );
 
-          // // Only transactions that happened after the order was created
-          // // This should handle deposit address re-assignment
-          // if (timestamp.getTime() < order.createdAt.getTime()) {
-          //   logger.warn(
-          //     'Ignoring tx %s that happened before order %s was created',
-          //     etherscanTx.hash,
-          //     orderId
-          //   );
-
-          //   return;
-          // }
+            return;
+          }
 
           logger.info('Scanning tx %s', etherscanTx.hash);
 
@@ -260,6 +259,7 @@ export const runConfirmedNativeTokenExtraWorker = async (): Promise<void> => {
         if (results.includes(true)) {
           break;
         }
+        // if didnt find the transaction continue looking on another page
         page += 1;
       }
     });
